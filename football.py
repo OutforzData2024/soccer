@@ -1,3 +1,694 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+from collections import defaultdict
+import io
+import re
+import math  # Для расчетов в сетевой диаграмме
+
+# Настройка страницы
+st.set_page_config(layout="wide", page_title="Футбольная аналитика")
+
+# Получаем настройки из боковой панели
+def add_settings_sidebar():
+    st.sidebar.title("Настройки анализа")
+    
+    # Общие настройки
+    st.sidebar.header("Общие настройки")
+    
+    show_help = st.sidebar.checkbox("Показывать подсказки", value=True)
+    
+    # Настройки визуализации
+    st.sidebar.header("Визуализация")
+    
+    color_scheme = st.sidebar.selectbox(
+        "Цветовая схема графиков",
+        ["Стандартная", "Командные цвета", "Зеленый-Оранжевый", "Пастельная"]
+    )
+    
+    chart_height = st.sidebar.slider("Высота графиков", 300, 800, 400, 50)
+    
+    # Настройки анализа
+    st.sidebar.header("Анализ")
+    
+    analysis_detail = st.sidebar.select_slider(
+        "Детализация анализа",
+        options=["Минимальная", "Средняя", "Подробная"],
+        value="Средняя"
+    )
+    
+    # Добавляем новые настройки для расширенного анализа
+    st.sidebar.header("Расширенный анализ")
+    
+    show_event_categories = st.sidebar.checkbox("Анализ категорий событий", value=True)
+    show_pressure_analysis = st.sidebar.checkbox("Анализ действий под давлением", value=True)
+    show_foot_analysis = st.sidebar.checkbox("Анализ использования ног", value=True)
+    show_pass_network = st.sidebar.checkbox("Сеть передач между игроками", value=True)
+    show_goalkeeper_analysis = st.sidebar.checkbox("Анализ действий вратарей", value=True)
+    
+    # Возвращаем настройки в виде словаря
+    return {
+        "show_help": show_help,
+        "color_scheme": color_scheme,
+        "chart_height": chart_height,
+        "analysis_detail": analysis_detail,
+        "show_event_categories": show_event_categories,
+        "show_pressure_analysis": show_pressure_analysis,
+        "show_foot_analysis": show_foot_analysis,
+        "show_pass_network": show_pass_network,
+        "show_goalkeeper_analysis": show_goalkeeper_analysis
+    }
+
+# Получаем цветовую схему на основе настроек
+def get_color_scheme(settings, teams=None):
+    if settings["color_scheme"] == "Командные цвета" and teams and len(teams) >= 2:
+        # Можно настроить цвета команд (пример с Шахтером - оранжево-черный)
+        team_colors = {
+            "Shakhtar": "#ff6600",  # Оранжевый для Шахтера
+            "Kozak": "#1e88e5"  # Синий для Козака (предположим)
+        }
+        
+        return {
+            "team1": team_colors.get(teams[0], "#ff6600"),
+            "team2": team_colors.get(teams[1], "#1e88e5")
+        }
+    elif settings["color_scheme"] == "Зеленый-Оранжевый":
+        return {"team1": "#15803d", "team2": "#c2410c"}
+    elif settings["color_scheme"] == "Пастельная":
+        return {"team1": "#0ea5e9", "team2": "#f472b6"}
+    else:  # Стандартная
+        return {"team1": "#0088FE", "team2": "#FF8042"}
+
+# Функция для анализа данных футбольного матча
+def analyze_match_data(df):
+    """
+    Анализирует данные футбольного матча из CSV и возвращает статистику для обеих команд.
+    """
+    # Определяем команды
+    teams = list(df['Team_1'].unique())
+    
+    # Инициализируем словарь для статистики
+    team_stats = {team: {} for team in teams}
+    
+    # Основные счетчики для общей статистики
+    for team in teams:
+        team_stats[team]['shots'] = 0
+        team_stats[team]['shots_on_target'] = 0
+        team_stats[team]['shots_off_target'] = 0
+        team_stats[team]['blocked_shots'] = 0
+        team_stats[team]['goals'] = 0
+        team_stats[team]['passes'] = 0
+        team_stats[team]['successful_passes'] = 0
+        team_stats[team]['crosses'] = 0
+        team_stats[team]['successful_crosses'] = 0
+        team_stats[team]['tackles'] = 0
+        team_stats[team]['successful_tackles'] = 0
+        team_stats[team]['interceptions'] = 0
+        team_stats[team]['fouls'] = 0
+        team_stats[team]['corners'] = 0
+        team_stats[team]['offsides'] = 0
+        team_stats[team]['possession_time'] = 0
+        team_stats[team]['player_stats'] = {}
+        team_stats[team]['pass_zones'] = defaultdict(int)
+        team_stats[team]['shot_locations'] = defaultdict(int)
+        team_stats[team]['shot_types'] = defaultdict(int)
+        team_stats[team]['pressure_stats'] = {'under_pressure': 0, 'no_pressure': 0}
+        team_stats[team]['half_stats'] = {1: {}, 2: {}}
+        
+        # Добавляем новые счетчики для расширенного анализа
+        team_stats[team]['event_categories'] = defaultdict(int)
+        team_stats[team]['event_types'] = defaultdict(lambda: defaultdict(int))
+        team_stats[team]['foot_used'] = defaultdict(int)
+        team_stats[team]['foot_by_event'] = defaultdict(lambda: defaultdict(int))
+        team_stats[team]['player_foot_usage'] = defaultdict(lambda: defaultdict(int))
+        team_stats[team]['gk_actions'] = defaultdict(int)
+        team_stats[team]['save_types'] = defaultdict(int)
+        team_stats[team]['pass_combinations'] = defaultdict(lambda: defaultdict(int))
+        team_stats[team]['pressure_results'] = defaultdict(lambda: defaultdict(int))
+        
+        # Инициализируем статистику по таймам
+        for half in [1, 2]:
+            team_stats[team]['half_stats'][half] = {
+                'shots': 0,
+                'goals': 0,
+                'passes': 0,
+                'successful_passes': 0,
+                'possession_time': 0
+            }
+    
+    # Анализируем каждое событие
+    for _, row in df.iterrows():
+        team = row['Team_1']
+        event = row['Event_Catalog']
+        event_type = row.get('Type', '')
+        match_half = row.get('Half', 1)  # По умолчанию первый тайм, если нет данных
+        
+        # Обновляем счетчик категорий событий
+        team_stats[team]['event_categories'][event] += 1
+        if event_type:
+            team_stats[team]['event_types'][event][event_type] += 1
+        
+        # Обновляем статистику по игрокам
+        player_name = row['Player_Name_1']
+        if player_name not in team_stats[team]['player_stats']:
+            team_stats[team]['player_stats'][player_name] = {
+                'shots': 0,
+                'goals': 0,
+                'passes': 0,
+                'successful_passes': 0,
+                'tackles': 0,
+                'interceptions': 0
+            }
+        
+        # Анализ использования ноги
+        foot_used = row.get('Foot_Used', '')
+        if foot_used:
+            team_stats[team]['foot_used'][foot_used] += 1
+            team_stats[team]['foot_by_event'][event][foot_used] += 1
+            team_stats[team]['player_foot_usage'][player_name][foot_used] += 1
+        
+        # Анализ событий
+        if event == 'Shot':
+            team_stats[team]['shots'] += 1
+            team_stats[team]['half_stats'][match_half]['shots'] += 1
+            team_stats[team]['player_stats'][player_name]['shots'] += 1
+            
+            # Типы ударов
+            shot_type = row.get('Type_Shots', 'Unknown')
+            if shot_type:
+                team_stats[team]['shot_types'][shot_type] += 1
+            
+            # Местоположение удара
+            shot_location = row.get('Shot_Location', 'Unknown')
+            if shot_location:
+                team_stats[team]['shot_locations'][shot_location] += 1
+            
+            # Результат удара
+            result = row.get('Results', '')
+            if result == 'Goal':
+                team_stats[team]['goals'] += 1
+                team_stats[team]['half_stats'][match_half]['goals'] += 1
+                team_stats[team]['player_stats'][player_name]['goals'] += 1
+                team_stats[team]['shots_on_target'] += 1
+            elif result == 'On Target':
+                team_stats[team]['shots_on_target'] += 1
+            elif result == 'Off Target':
+                team_stats[team]['shots_off_target'] += 1
+            elif result == 'Blocked':
+                team_stats[team]['blocked_shots'] += 1
+            
+            # Анализ под давлением для ударов
+            pressure = row.get('Pressure', '')
+            if pressure:
+                team_stats[team]['pressure_results'][pressure][result] += 1
+        
+        elif event == 'Pass':
+            team_stats[team]['passes'] += 1
+            team_stats[team]['half_stats'][match_half]['passes'] += 1
+            team_stats[team]['player_stats'][player_name]['passes'] += 1
+            
+            # Зона паса (используем координаты X2, Y2)
+            x2, y2 = row.get('X2', 0), row.get('Y2', 0)
+            zone = get_field_zone(x2, y2)
+            team_stats[team]['pass_zones'][zone] += 1
+            
+            # Тип паса
+            pass_type = row.get('Type', 'Normal')
+            
+            # Успешные пасы
+            pass_outcome = row.get('Pass_Outcome', '')
+            if pass_outcome == 'Successful':
+                team_stats[team]['successful_passes'] += 1
+                team_stats[team]['half_stats'][match_half]['successful_passes'] += 1
+                team_stats[team]['player_stats'][player_name]['successful_passes'] += 1
+                
+                # Учитываем комбинации пасов между игроками
+                if 'Player_Name_2' in row and pd.notna(row['Player_Name_2']):
+                    receiving_player = row['Player_Name_2']
+                    team_stats[team]['pass_combinations'][player_name][receiving_player] += 1
+            
+            # Кросс
+            if pass_type == 'Cross':
+                team_stats[team]['crosses'] += 1
+                if pass_outcome == 'Successful':
+                    team_stats[team]['successful_crosses'] += 1
+            
+            # Статистика под давлением
+            pressure = row.get('Pressure', '')
+            if pressure == 'Yes':
+                team_stats[team]['pressure_stats']['under_pressure'] += 1
+                # Анализируем результаты пасов под давлением
+                team_stats[team]['pressure_results']['Yes'][pass_outcome] += 1
+            elif pressure == 'No':
+                team_stats[team]['pressure_stats']['no_pressure'] += 1
+                team_stats[team]['pressure_results']['No'][pass_outcome] += 1
+        
+        elif event == 'Tackle':
+            team_stats[team]['tackles'] += 1
+            team_stats[team]['player_stats'][player_name]['tackles'] += 1
+            
+            # Успешные отборы
+            result = row.get('Results', '')
+            if result == 'Successful':
+                team_stats[team]['successful_tackles'] += 1
+        
+        elif event == 'Interception':
+            team_stats[team]['interceptions'] += 1
+            team_stats[team]['player_stats'][player_name]['interceptions'] += 1
+        
+        elif event == 'Foul':
+            team_stats[team]['fouls'] += 1
+        
+        elif event == 'Corner':
+            team_stats[team]['corners'] += 1
+        
+        elif event == 'Offside':
+            team_stats[team]['offsides'] += 1
+            
+        elif event == 'Goalkeeper Action':
+            # Анализ действий вратаря
+            gk_action = row.get('GK_Action', '')
+            if gk_action:
+                team_stats[team]['gk_actions'][gk_action] += 1
+            
+            # Тип сейва
+            save_type = row.get('Save_Type', '')
+            if save_type:
+                team_stats[team]['save_types'][save_type] += 1
+    
+    # Расчет процентов и соотношений
+    for team in teams:
+        # Точность ударов
+        if team_stats[team]['shots'] > 0:
+            team_stats[team]['shot_accuracy'] = round(
+                team_stats[team]['shots_on_target'] / team_stats[team]['shots'] * 100, 1
+            )
+        else:
+            team_stats[team]['shot_accuracy'] = 0
+        
+        # Точность пасов
+        if team_stats[team]['passes'] > 0:
+            team_stats[team]['pass_accuracy'] = round(
+                team_stats[team]['successful_passes'] / team_stats[team]['passes'] * 100, 1
+            )
+        else:
+            team_stats[team]['pass_accuracy'] = 0
+        
+        # Точность кроссов
+        if team_stats[team]['crosses'] > 0:
+            team_stats[team]['cross_accuracy'] = round(
+                team_stats[team]['successful_crosses'] / team_stats[team]['crosses'] * 100, 1
+            )
+        else:
+            team_stats[team]['cross_accuracy'] = 0
+        
+        # Точность отборов
+        if team_stats[team]['tackles'] > 0:
+            team_stats[team]['tackle_success'] = round(
+                team_stats[team]['successful_tackles'] / team_stats[team]['tackles'] * 100, 1
+            )
+        else:
+            team_stats[team]['tackle_success'] = 0
+        
+        # Статистика под давлением
+        total_pressure_events = (team_stats[team]['pressure_stats']['under_pressure'] + 
+                               team_stats[team]['pressure_stats']['no_pressure'])
+        if total_pressure_events > 0:
+            team_stats[team]['pressure_percentage'] = round(
+                team_stats[team]['pressure_stats']['under_pressure'] / total_pressure_events * 100, 1
+            )
+        else:
+            team_stats[team]['pressure_percentage'] = 0
+            
+        # Расчет статистики для игроков
+        for player in team_stats[team]['player_stats']:
+            player_stats = team_stats[team]['player_stats'][player]
+            
+            # Точность пасов игроков
+            if player_stats['passes'] > 0:
+                player_stats['pass_accuracy'] = round(
+                    player_stats['successful_passes'] / player_stats['passes'] * 100, 1
+                )
+            else:
+                player_stats['pass_accuracy'] = 0
+                
+            # Эффективность ударов игроков
+            if player_stats['shots'] > 0:
+                player_stats['goal_conversion'] = round(
+                    player_stats['goals'] / player_stats['shots'] * 100, 1
+                )
+            else:
+                player_stats['goal_conversion'] = 0
+    
+    return team_stats
+
+# Функция для определения зоны поля на основе координат
+def get_field_zone(x, y):
+    """
+    Определяет зону поля на основе координат.
+    Предполагаем, что координаты нормализованы от 0 до 100.
+    """
+    # Упрощенная модель с 9 зонами (3x3)
+    if x < 33:
+        if y < 33:
+            return "Defensive Left"
+        elif y < 66:
+            return "Defensive Center"
+        else:
+            return "Defensive Right"
+    elif x < 66:
+        if y < 33:
+            return "Middle Left"
+        elif y < 66:
+            return "Middle Center"
+        else:
+            return "Middle Right"
+    else:
+        if y < 33:
+            return "Attacking Left"
+        elif y < 66:
+            return "Attacking Center"
+        else:
+            return "Attacking Right"
+
+# Функция для создания графика статистики команд
+def create_team_stats_chart(team_stats, colors, height=400):
+    """
+    Создает график сравнения основной статистики команд.
+    """
+    teams = list(team_stats.keys())
+    
+    # Создаем данные для графика
+    data = []
+    for team in teams:
+        data.append({
+            'Команда': team,
+            'Показатель': 'Удары',
+            'Значение': team_stats[team].get('shots', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Удары в створ',
+            'Значение': team_stats[team].get('shots_on_target', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Голы',
+            'Значение': team_stats[team].get('goals', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Угловые',
+            'Значение': team_stats[team].get('corners', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Офсайды',
+            'Значение': team_stats[team].get('offsides', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Фолы',
+            'Значение': team_stats[team].get('fouls', 0)
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Создаем график
+    fig = px.bar(
+        df, 
+        x='Показатель', 
+        y='Значение', 
+        color='Команда',
+        barmode='group',
+        color_discrete_map={teams[0]: colors['team1'], teams[1]: colors['team2']} if len(teams) > 1 else None,
+        height=height
+    )
+    
+    fig.update_layout(
+        title='Основная статистика команд',
+        xaxis_title=None,
+        yaxis_title='Количество',
+        legend_title='Команда'
+    )
+    
+    return fig
+
+# Функция для создания графика пасов
+def create_pass_stats_chart(team_stats, colors, height=400):
+    """
+    Создает график статистики пасов команд.
+    """
+    teams = list(team_stats.keys())
+    
+    # Создаем данные для графика
+    data = []
+    for team in teams:
+        data.append({
+            'Команда': team,
+            'Показатель': 'Всего пасов',
+            'Значение': team_stats[team].get('passes', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Точность пасов (%)',
+            'Значение': team_stats[team].get('pass_accuracy', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Кроссы',
+            'Значение': team_stats[team].get('crosses', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Точность кроссов (%)',
+            'Значение': team_stats[team].get('cross_accuracy', 0)
+        })
+        data.append({
+            'Команда': team,
+            'Показатель': 'Пасы под давлением (%)',
+            'Значение': team_stats[team].get('pressure_percentage', 0)
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Создаем график
+    fig = px.bar(
+        df, 
+        x='Показатель', 
+        y='Значение', 
+        color='Команда',
+        barmode='group',
+        color_discrete_map={teams[0]: colors['team1'], teams[1]: colors['team2']} if len(teams) > 1 else None,
+        height=height
+    )
+    
+    fig.update_layout(
+        title='Статистика пасов',
+        xaxis_title=None,
+        yaxis_title='Значение',
+        legend_title='Команда'
+    )
+    
+    return fig
+
+# Функция для создания тепловой карты пасов
+def create_pass_heatmap(team_stats, team, color, height=500):
+    """
+    Создает тепловую карту пасов на футбольном поле.
+    """
+    # Получаем данные о зонах пасов
+    pass_zones = team_stats[team].get('pass_zones', {})
+    total_passes = sum(pass_zones.values()) if pass_zones else 0
+    
+    # Создаем фигуру
+    fig = go.Figure()
+    
+    # Создаем сетку данных для тепловой карты
+    grid_size = 10
+    x = np.linspace(0, 100, grid_size)
+    y = np.linspace(0, 100, grid_size)
+    z = np.zeros((grid_size, grid_size))
+    
+    # Заполняем тепловую карту
+    zone_to_coords = {
+        "Defensive Left": (16, 16),
+        "Defensive Center": (16, 50),
+        "Defensive Right": (16, 84),
+        "Middle Left": (50, 16),
+        "Middle Center": (50, 50),
+        "Middle Right": (50, 84),
+        "Attacking Left": (84, 16),
+        "Attacking Center": (84, 50),
+        "Attacking Right": (84, 84)
+    }
+    
+    for zone, count in pass_zones.items():
+        if zone in zone_to_coords and total_passes > 0:
+            i, j = zone_to_coords[zone]
+            # Находим ближайшие индексы в нашей сетке
+            i_idx = int(i / 100 * (grid_size - 1))
+            j_idx = int(j / 100 * (grid_size - 1))
+            
+            # Добавляем "тепло" пропорционально количеству пасов
+            if i_idx < grid_size and j_idx < grid_size:
+                z[i_idx, j_idx] = count / total_passes * 100
+    
+    # Добавляем тепловую карту
+    fig.add_trace(go.Heatmap(
+        z=z,
+        x=y,  # Обратите внимание на переворот x и y для правильного отображения поля
+        y=x,
+        colorscale=[[0, 'rgba(255,255,255,0)'], [1, color]],
+        showscale=True,
+        colorbar=dict(title="% пасов")
+    ))
+    
+    # Добавляем контуры футбольного поля
+    # Внешние границы поля
+    fig.add_shape(type="rect", x0=0, y0=0, x1=100, y1=100, line=dict(color="white"), fillcolor="rgba(0,100,0,0.3)")
+    
+    # Центральный круг
+    fig.add_shape(type="circle", x0=40, y0=40, x1=60, y1=60, line=dict(color="white"))
+    
+    # Центральная линия
+    fig.add_shape(type="line", x0=0, y0=50, x1=100, y1=50, line=dict(color="white"))
+    
+    # Штрафные площади
+    fig.add_shape(type="rect", x0=0, y0=30, x1=16, y1=70, line=dict(color="white"))
+    fig.add_shape(type="rect", x0=84, y0=30, x1=100, y1=70, line=dict(color="white"))
+    
+    # Настраиваем макет
+    fig.update_layout(
+        title=f"Тепловая карта пасов - {team}",
+        height=height,
+        xaxis=dict(showgrid=False, zeroline=False, range=[0, 100], scaleanchor="y", scaleratio=1),
+        yaxis=dict(showgrid=False, zeroline=False, range=[0, 100]),
+        margin=dict(l=0, r=0, t=40, b=0)
+    )
+    
+    return fig
+
+# Функция для создания диаграммы типов ударов
+def create_shot_types_chart(team_stats, team, color, height=400):
+    """
+    Создает диаграмму типов ударов команды.
+    """
+    shot_types = team_stats[team].get('shot_types', {})
+    
+    if not shot_types:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"Нет данных о типах ударов для {team}",
+            height=height
+        )
+        return fig
+    
+    # Преобразуем словарь в списки для построения графика
+    labels = list(shot_types.keys())
+    values = list(shot_types.values())
+    
+    # Создаем круговую диаграмму
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=.3,
+        marker_colors=[color, color+'90', color+'70', color+'50', color+'30']
+    )])
+    
+    fig.update_layout(
+        title=f"Типы ударов - {team}",
+        height=height
+    )
+    
+    return fig
+
+# Функция для создания диаграммы результатов ударов
+def create_shot_outcomes_chart(team_stats, team, color, height=400):
+    """
+    Создает диаграмму результатов ударов команды.
+    """
+    # Собираем данные о результатах ударов
+    shot_outcomes = {
+        'Голы': team_stats[team].get('goals', 0),
+        'Удары в створ (не голы)': team_stats[team].get('shots_on_target', 0) - team_stats[team].get('goals', 0),
+        'Удары мимо': team_stats[team].get('shots_off_target', 0),
+        'Заблокированные удары': team_stats[team].get('blocked_shots', 0)
+    }
+    
+    # Преобразуем словарь в списки для построения графика
+    labels = list(shot_outcomes.keys())
+    values = list(shot_outcomes.values())
+    
+    # Цвета для разных исходов
+    colors = ['#2ecc71', '#3498db', '#e74c3c', '#95a5a6']
+    
+    # Создаем круговую диаграмму
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=.3,
+        marker_colors=colors
+    )])
+    
+    fig.update_layout(
+        title=f"Результаты ударов - {team}",
+        height=height
+    )
+    
+    return fig
+
+# Функция для создания графика статистики игроков
+def create_player_stats_chart(team_stats, team, category, color, height=500, top_n=10):
+    """
+    Создает график статистики игроков по выбранной категории.
+    
+    Args:
+        team_stats: Статистика команд
+        team: Команда для анализа
+        category: Категория статистики ('goals', 'passes', 'pass_accuracy', etc.)
+        color: Цвет для графика
+        height: Высота графика
+        top_n: Количество лучших игроков для отображения
+    """
+    player_stats = team_stats[team].get('player_stats', {})
+    
+    # Категория для отображения
+    category_display = {
+        'goals': 'Голы',
+        'shots': 'Удары',
+        'passes': 'Пасы',
+        'pass_accuracy': 'Точность пасов (%)',
+        'tackles': 'Отборы',
+        'interceptions': 'Перехваты',
+        'goal_conversion': 'Конверсия ударов в голы (%)'
+    }
+    
+    # Создаем данные для графика
+    data = []
+    for player, stats in player_stats.items():
+        if category in stats:
+            data.append({
+                'Игрок': player,
+                category_display.get(category, category): stats[category]
+            })
+    
+    # Сортируем по убыванию и берем топ N
+    data = sorted(data, key=lambda x: x[category_display.get(category, category)], reverse=True)[:top_n]
+    
+    if not data:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"Нет данных о {category_display.get(category, category)} для игроков {team}",
+            height=height
+        )
+        return fig
+    
+    # Создаем DataFrame
+    df = pd.DataFrame(data)
+    
 # Создаем горизонтальную столбчатую диаграмму
     fig = px.bar(
         df,
@@ -768,7 +1459,7 @@ def generate_team_insights(team_stats, opponent_stats=None, detail_level="Сре
                 f"Команда значительно усилила атаку во втором тайме "
                 f"({team_first_half_shots} ударов в первом тайме, {team_second_half_shots} во втором)."
             )
-elif team_first_half_shots > team_second_half_shots * 1.5:
+        elif team_first_half_shots > team_second_half_shots * 1.5:
             insights['tactics'].append(
                 f"Команда ослабила атаку во втором тайме "
                 f"({team_first_half_shots} ударов в первом тайме, {team_second_half_shots} во втором)."
